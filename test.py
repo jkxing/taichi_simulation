@@ -3,7 +3,7 @@
 
 import math
 from os import write
-
+from pyjet import *
 import numpy as np
 from numpy.core.fromnumeric import mean
 
@@ -16,7 +16,7 @@ mx = np.ones((3))*-100
 mn = np.ones((3))*100
 points = []
 face = []
-n = 120
+n = 1
 for i in range(1,n+1):
     mesh = meshio.read("data/output_mesh_%d_.obj"%(i))
     mesh.points[...,1:3] = mesh.points[...,2:0:-1]
@@ -26,7 +26,8 @@ for i in range(1,n+1):
     if i==1:
         face = mesh.cells_dict['triangle']
     meshio.write("data/output_mesh_%d_scale.obj"%(i), mesh)
-
+query_point = np.load("query_point.npy")
+num_query_point = query_point.shape[0]
 point_num = points[0].shape[0]
 face_num = face.shape[0]
 points = np.asarray(points)
@@ -35,7 +36,7 @@ screen_res = (1000, 1000)
 screen_to_world_ratio = 40
 dim = 3
 b_min = ti.Vector((-screen_res[0]/screen_to_world_ratio/2,-screen_res[1]/screen_to_world_ratio/2,0))
-b_max = ti.Vector((screen_res[0]/screen_to_world_ratio/2,screen_res[1]/screen_to_world_ratio/2,100))
+b_max = ti.Vector((screen_res[0]/screen_to_world_ratio/2,screen_res[1]/screen_to_world_ratio/2,screen_res[1]/screen_to_world_ratio))
 
 cell_size = 1.25
 grid_size = [math.ceil((b_max[x]-b_min[x])//cell_size) for x in range(dim)]
@@ -51,6 +52,7 @@ max_num_particles_per_cell=100
 max_num_neighbors = 100
 
 old_positions = ti.Vector.field(dim, float)
+query_positions = ti.Vector.field(dim, float)
 positions = ti.Vector.field(dim, float)
 velocities = ti.Vector.field(dim, float)
 grid_num_particles = ti.field(int)
@@ -59,11 +61,14 @@ particle_num_neighbors = ti.field(int)
 particle_neighbors = ti.field(int)
 
 lambdas = ti.field(float)
+query_positions_density = ti.field(float)
 position_deltas = ti.Vector.field(dim, float)
 
 frames = ti.field(ti.i32)
 
 ti.root.dense(ti.i, num_particles).place(old_positions, positions, velocities)
+ti.root.dense(ti.i, num_query_point).place(query_positions)
+ti.root.dense(ti.i, num_query_point).place(query_positions_density)
 grid_snode = ti.root.dense(ti.ijk, grid_size)
 grid_snode.place(grid_num_particles)
 nb_node = ti.root.dense(ti.i, num_particles)
@@ -71,11 +76,13 @@ nb_node.place(particle_num_neighbors)
 nb_node.dense(ti.j, max_num_neighbors).place(particle_neighbors)
 ti.root.dense(ti.i, num_particles).place(lambdas, position_deltas)
 ti.root.dense(ti.i, 1).place(frames)
+
 cam = Canvas(1000,1000)
 point_ti = ti.Vector(3, dt=ti.f32, shape=(n, point_num))
 face_ti = ti.Vector(3, dt=ti.i32, shape=(face_num))
 point_ti.from_numpy(points)
 face_ti.from_numpy(face)
+query_positions.from_numpy(query_point)
 
 h = 1.1
 mass = 1.0
@@ -100,7 +107,7 @@ def initParticles():
     for i in range(num_particles):
         x = i%num_particles_x - num_particles_x/2
         z = i//num_particles_x%num_particles_z - num_particles_z/2
-        y = i//(num_particles_x*num_particles_z) - num_particles_y/2+50
+        y = i//(num_particles_x*num_particles_z) - num_particles_y/2+20
         positions[i] = ti.Vector([x,z,y]) * delta
 
 
@@ -111,42 +118,6 @@ def confineBoundary(pos,old_pos,cnt):
             pos[i] = b_min[i] + particle_radius_in_world + epsilon*ti.random()
         elif pos[i] > b_max[i] - particle_radius_in_world:
             pos[i] = b_max[i] - particle_radius_in_world - epsilon*ti.random()
-    frame = 60
-    if frames[0]>60:
-        frame = frames[0]
-    flag = True
-    for j in range(face.shape[0]):
-        if flag:
-            a = point_ti[(frame-60)%120,face_ti[j][0]]
-            b = point_ti[(frame-60)%120,face_ti[j][1]]
-            c = point_ti[(frame-60)%120,face_ti[j][2]]
-            v0 = b-a
-            v1 = c-a
-            n = v0.cross(v1)
-            n = n/n.norm()
-            D = n.dot(a-old_pos)
-            dir = (pos-old_pos)
-            t = D/(n.dot(dir))
-            if t<0 or t>1:
-                continue
-            npos = old_pos+t*(pos-old_pos)
-            v2 = npos-a
-            dot00 = v0.dot(v0)
-            dot01 = v0.dot(v1)
-            dot02 = v0.dot(v2)
-            dot11 = v1.dot(v1)
-            dot12 = v1.dot(v2)
-            inverDeno = 1 / (dot00 * dot11 - dot01 * dot01)
-            u = (dot11 * dot02 - dot01 * dot12) * inverDeno
-            if u<0 or u>1:
-                continue
-            v = (dot00 * dot12 - dot01 * dot02) * inverDeno
-            if v<0 or v>1:
-                continue
-            if u+v>1:
-                continue
-            pos = old_pos+(t-0.001)*(pos-old_pos)
-            flag = False                   
     return pos
 
 @ti.kernel
@@ -195,6 +166,7 @@ def prologue():
         if offs< max_num_particles_per_cell:
             grid2particles[cell, offs] = p_i
     
+    
     for p_i in positions:
         pos_i = positions[p_i]
         cell = get_cell(pos_i)
@@ -209,6 +181,7 @@ def prologue():
                         particle_neighbors[p_i, nb_i] = p_j
                         nb_i += 1
         particle_num_neighbors[p_i] = nb_i
+
 @ti.func
 def spiky_gradient(r, h):
     result = ti.Vector([0.0, 0.0, 0.0])
@@ -312,12 +285,31 @@ def print_stats():
     print(f'  #neighbors per particle: avg={avg:.2f} max={max}')
 
 def render(gui, cnt):
-    #gui.clear(bg_color)
-    pos_np = positions.to_numpy()
-    with open("output/%d.ply"%(cnt),"w") as f:
-        f.write("ply\nformat ascii 1.0\nelement vertex %d\nproperty float x\nproperty float y\nproperty float z\nend_header\n"%(num_particles))
-        for i in range(pos_np.shape[0]):
-            f.write("%.4lf %.4lf %.4lf\n"%(pos_np[i,0],pos_np[i,1],pos_np[i,2]))
+    pos_np = (positions.to_numpy() + np.array([12.5,12.5,0]))/25.0
+    #with open("output/%d.ply"%(cnt),"w") as f:
+    #    f.write("ply\nformat ascii 1.0\nelement vertex %d\nproperty float x\nproperty float y\nproperty float z\nend_header\n"%(num_particles))
+    #    for i in range(pos_np.shape[0]):
+    #        f.write("%.4lf %.4lf %.4lf\n"%(pos_np[i,0],pos_np[i,1],pos_np[i,2]))
+    if cnt>=10000:
+        resX = 256
+        grid_size = 1.0/resX
+        grid = VertexCenteredScalarGrid3((resX, resX, resX), (grid_size,grid_size,grid_size))
+        converter = SphPointsToImplicit3(1.5 * grid_size, 0.5)
+        converter.convert(pos_np.tolist(), grid)
+        surface_mesh = marchingCubes(
+            grid,
+            (grid_size,grid_size,grid_size),
+            (0, 0 ,0),
+            0.1,
+            DIRECTION_ALL,
+            DIRECTION_ALL
+        )
+        surface_mesh.writeObj('output/frame_{:06d}.obj'.format(cnt))
+
+
+    #query_positions_density_np = query_positions_density.to_numpy()
+    #np.save("output/%d.npy"%(cnt),query_positions_density_np)
+    #mesh = marching_cubes_3d()
     #for j in range(dim):
     #    pos_np[:, j] = (pos_np[:, j]-b_min[j])/(b_max[j]-b_min[j])
     #gui.circles(pos_np[:,0::2], radius=particle_radius, color=particle_color)
