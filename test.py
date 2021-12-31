@@ -1,136 +1,114 @@
 # Macklin, M. and Müller, M., 2013. Position based fluids. ACM Transactions on Graphics (TOG), 32(4), p.104.
-# Taichi implementation by Ye Kuang (k-ye)
-
-import math
-from os import write
-from pyjet import *
-import numpy as np
-from numpy.core.fromnumeric import mean
+# Based on 2D Taichi implementation by Ye Kuang (k-ye)
 
 import taichi as ti
-
-import meshio
+import numpy as np
+import math
+import time
+from pyjet import *
 from canvas import Canvas
 
-mx = np.ones((3))*-100
-mn = np.ones((3))*100
-points = []
-face = []
-n = 1
-for i in range(1,n+1):
-    mesh = meshio.read("data/output_mesh_%d_.obj"%(i))
-    mesh.points[...,1:3] = mesh.points[...,2:0:-1]
-    mean_point = np.average(mesh.points,axis = 0)
-    mesh.points = mesh.points*10
-    points.append(mesh.points)
-    if i==1:
-        face = mesh.cells_dict['triangle']
-    meshio.write("data/output_mesh_%d_scale.obj"%(i), mesh)
-query_point = np.load("query_point.npy")
-num_query_point = query_point.shape[0]
-point_num = points[0].shape[0]
-face_num = face.shape[0]
-points = np.asarray(points)
+#import open3d as o3d
+
 ti.init(arch=ti.gpu)
-screen_res = (1000, 1000)
-screen_to_world_ratio = 40
+
+base_size_factor = 400
+scaling_size_factor = 1
+
+res_3D = np.array([1, 1, 1]) * base_size_factor * scaling_size_factor
+screen_res = res_3D[[0,2]].astype(np.int32) 
+
+screen_to_world_ratio = 10.0 * scaling_size_factor
+boundary = res_3D / screen_to_world_ratio
+cell_size = 2.51 / scaling_size_factor
+cell_recpr = 1.0 / cell_size
+
+def round_up(f, s):
+    return (math.floor(f * cell_recpr / s) + 1) * s
+
+grid_size = (round_up(boundary[0], 1), round_up(boundary[1], 1), round_up(boundary[2], 1))
+
 dim = 3
-b_min = ti.Vector((-screen_res[0]/screen_to_world_ratio/2,-screen_res[1]/screen_to_world_ratio/2,0))
-b_max = ti.Vector((screen_res[0]/screen_to_world_ratio/2,screen_res[1]/screen_to_world_ratio/2,screen_res[1]/screen_to_world_ratio))
-
-cell_size = 1.25
-grid_size = [math.ceil((b_max[x]-b_min[x])//cell_size) for x in range(dim)]
-
 bg_color = 0x112f41
 particle_color = 0x068587
 boundary_color = 0xebaca2
-num_particles_x = 30
-num_particles_z = 30
-num_particles_y = 30
+num_particles_x = 40
+num_particles_y = 20
+num_particles_z = 20
 num_particles = num_particles_x * num_particles_y * num_particles_z
-max_num_particles_per_cell=100
-max_num_neighbors = 100
+max_num_particles_per_cell = 200
+max_num_neighbors = 200
+time_delta = 1.0 / 20.0
+epsilon = 1e-5
+particle_radius = 3.0 
+particle_radius_in_world = particle_radius / screen_to_world_ratio
 
-old_positions = ti.Vector.field(dim, float)
-query_positions = ti.Vector.field(dim, float)
-positions = ti.Vector.field(dim, float)
-velocities = ti.Vector.field(dim, float)
-grid_num_particles = ti.field(int)
-grid2particles = ti.field(int, shape=(grid_size[0], grid_size[1], grid_size[2], max_num_particles_per_cell))
-particle_num_neighbors = ti.field(int)
-particle_neighbors = ti.field(int)
-
-lambdas = ti.field(float)
-query_positions_density = ti.field(float)
-position_deltas = ti.Vector.field(dim, float)
-
-frames = ti.field(ti.i32)
-
-ti.root.dense(ti.i, num_particles).place(old_positions, positions, velocities)
-ti.root.dense(ti.i, num_query_point).place(query_positions)
-ti.root.dense(ti.i, num_query_point).place(query_positions_density)
-grid_snode = ti.root.dense(ti.ijk, grid_size)
-grid_snode.place(grid_num_particles)
-nb_node = ti.root.dense(ti.i, num_particles)
-nb_node.place(particle_num_neighbors)
-nb_node.dense(ti.j, max_num_neighbors).place(particle_neighbors)
-ti.root.dense(ti.i, num_particles).place(lambdas, position_deltas)
-ti.root.dense(ti.i, 1).place(frames)
-
-cam = Canvas(1000,1000)
-point_ti = ti.Vector(3, dt=ti.f32, shape=(n, point_num))
-face_ti = ti.Vector(3, dt=ti.i32, shape=(face_num))
-point_ti.from_numpy(points)
-face_ti.from_numpy(face)
-query_positions.from_numpy(query_point)
-
+# PBF params
 h = 1.1
 mass = 1.0
-rho0 = 4.0
+rho0 = 1.0
 lambda_epsilon = 100.0
+vorticity_epsilon = 0.01
+viscosity_c = 0.01
 pbf_num_iters = 5
 corr_deltaQ_coeff = 0.3
 corrK = 0.001
 neighbor_radius = h * 1.05
-poly6_factor = 315.0 / 64.0 / math.pi
-spiky_grad_factor = -45.0 / math.pi
 
-particle_radius = 3
-particle_radius_in_world = 3.0 / screen_to_world_ratio
-pbf_num_iters = 5
-time_delta = 1.0/24
-epsilon = 1e-5
+poly6_factor = 315.0 / 64.0 / np.pi
+spiky_grad_factor = -45.0 / np.pi
 
-@ti.kernel
-def initParticles():
-    delta = h * 0.5
-    for i in range(num_particles):
-        x = i%num_particles_x - num_particles_x/2
-        z = i//num_particles_x%num_particles_z - num_particles_z/2
-        y = i//(num_particles_x*num_particles_z) - num_particles_y/2+20
-        positions[i] = ti.Vector([x,z,y]) * delta
+old_positions = ti.Vector(dim, dt=ti.f32)
+positions = ti.Vector(dim, dt=ti.f32)
+velocities = ti.Vector(dim, dt=ti.f32)
+grid_num_particles = ti.var(ti.i32)
+grid2particles = ti.var(ti.i32)
+particle_num_neighbors = ti.var(ti.i32)
+particle_neighbors = ti.var(ti.i32)
+lambdas = ti.var(ti.f32)
+position_deltas = ti.Vector(dim, dt=ti.f32)
+# 0: x-pos, 1: timestep in sin()
+board_states = ti.Vector(2, dt=ti.f32)
+
+ti.root.dense(ti.i, num_particles).place(old_positions, positions, velocities)
+grid_snode = ti.root.dense(ti.ijk, grid_size)
+grid_snode.place(grid_num_particles)
+grid_snode.dense(ti.l, max_num_particles_per_cell).place(grid2particles)
+nb_node = ti.root.dense(ti.i, num_particles)
+nb_node.place(particle_num_neighbors)
+nb_node.dense(ti.j, max_num_neighbors).place(particle_neighbors)
+ti.root.dense(ti.i, num_particles).place(lambdas, position_deltas)
+ti.root.place(board_states)
 
 
-@ti.func
-def confineBoundary(pos,old_pos,cnt):
-    for i in ti.static(range(dim)):
-        if pos[i] < b_min[i] + particle_radius_in_world:
-            pos[i] = b_min[i] + particle_radius_in_world + epsilon*ti.random()
-        elif pos[i] > b_max[i] - particle_radius_in_world:
-            pos[i] = b_max[i] - particle_radius_in_world - epsilon*ti.random()
-    return pos
-
-@ti.kernel
-def test():
-    global frames
-    frames[0] = 60
-    old_pos = ti.Vector([1.05,-0.25,0.9])
-    pos = ti.Vector([1.05,-0.25,0.92])
-    confineBoundary(pos,old_pos)
 
 @ti.func
 def get_cell(pos):
-    return (pos-b_min)//cell_size
+    return (pos * cell_recpr).cast(int)
+
+@ti.func
+def confine_position_to_boundary(p):
+    bmin = particle_radius_in_world
+    # First coordinate is for the x position of the board, which only moves in x
+    bmax = ti.Vector([board_states[None][0], boundary[1], boundary[2]]) - particle_radius_in_world
+    for i in ti.static(range(dim)):
+        # Use randomness to prevent particles from sticking into each other after clamping
+        if p[i] <= bmin:
+            p[i] = bmin + epsilon * ti.random()
+        elif bmax[i] <= p[i]:
+            p[i] = bmax[i] - epsilon * ti.random()
+    return p
+
+@ti.kernel
+def move_board():
+    b = board_states[None]
+    b[1] += 1.0
+    period = 90
+    vel_strength = 8.0
+    if b[1] >= 2 * period:
+        b[1] = 0
+    b[0] += -ti.sin(b[1] * np.pi / period) * vel_strength * time_delta
+    board_states[None] = b
 
 @ti.func
 def in_grid(cell_grid):
@@ -142,7 +120,6 @@ def in_grid(cell_grid):
 
 @ti.kernel
 def prologue():
-    frames[0]+=1
     for i in positions:
         old_positions[i] = positions[i]
     for i in positions:
@@ -150,10 +127,8 @@ def prologue():
         pos,vel = positions[i], velocities[i]
         vel += g*time_delta
         pos += vel*time_delta
-        old_pos = old_positions[i]
-        positions[i] = confineBoundary(pos,old_pos,0)
-        pos = positions[i]
-        positions[i] = confineBoundary(pos,old_pos,1)
+        positions[i] = confine_position_to_boundary(pos)
+
     for I in ti.grouped(grid_num_particles):
         grid_num_particles[I] = 0
     for I in ti.grouped(particle_neighbors):
@@ -202,9 +177,7 @@ def poly6_value(s, h):
 
 @ti.func
 def compute_scorr(pos_ji):
-    # Eq (13)
     x = poly6_value(pos_ji.norm(), h) / poly6_value(corr_deltaQ_coeff * h, h)
-    # pow(x, 4)
     x = x * x
     x = x * x
     return (-corrK) * x
@@ -243,8 +216,7 @@ def substep():
             lambda_j = lambdas[p_j]
             pos_ji = pos_i - positions[p_j]
             scorr_ij = compute_scorr(pos_ji)
-            pos_delta_i += (lambda_i + lambda_j + scorr_ij) * \
-                spiky_gradient(pos_ji, h)
+            pos_delta_i += (lambda_i + lambda_j + scorr_ij) * spiky_gradient(pos_ji, h)
 
         pos_delta_i /= rho0
         position_deltas[p_i] = pos_delta_i
@@ -252,92 +224,110 @@ def substep():
     for i in positions:
         positions[i] += position_deltas[i]
 
+
 @ti.kernel
 def epilogue():
-    # confine to boundary
     for i in positions:
         pos = positions[i]
-        old_pos = old_positions[i]
-        positions[i] = confineBoundary(pos,old_pos,0)
-        pos = positions[i]
-        positions[i] = confineBoundary(pos,old_pos,1)
-    # update velocities
+        positions[i] = confine_position_to_boundary(pos)
+    
     for i in positions:
         velocities[i] = (positions[i] - old_positions[i]) / time_delta
-    # no vorticity/xsph because we cannot do cross product in 2D...
+    
+    for v_i in velocities:
+        pos_i = positions[v_i]
+        vel_i = velocities[v_i]
+        v_delta_i = ti.Vector([0.0, 0.0, 0.0])
 
-def runPBF():
-    print("pro")
+        for j in range(particle_num_neighbors[v_i]):
+            p_j = particle_neighbors[v_i, j]
+            pos_ji = pos_i - positions[p_j]
+            vel_ij = velocities[p_j] - vel_i
+            if p_j >= 0:
+                pos_ji = pos_i - positions[p_j]
+                v_delta_i += vel_ij * poly6_value(pos_ji.norm(), h)
+
+        velocities[v_i] += viscosity_c * v_delta_i
+
+def run_pbf():
     prologue()
-    print("substep")
     for _ in range(pbf_num_iters):
         substep()
-    print("ep")
     epilogue()
 
-def print_stats():
-    print('PBF stats:')
-    num = grid_num_particles.to_numpy()
-    avg, max = np.mean(num), np.max(num)
-    print(f'  #particles per cell: avg={avg:.2f} max={max}')
-    num = particle_num_neighbors.to_numpy()
-    avg, max = np.mean(num), np.max(num)
-    print(f'  #neighbors per particle: avg={avg:.2f} max={max}')
 
-def render(gui, cnt):
-    pos_np = (positions.to_numpy() + np.array([12.5,12.5,0]))/25.0
-    #with open("output/%d.ply"%(cnt),"w") as f:
-    #    f.write("ply\nformat ascii 1.0\nelement vertex %d\nproperty float x\nproperty float y\nproperty float z\nend_header\n"%(num_particles))
-    #    for i in range(pos_np.shape[0]):
-    #        f.write("%.4lf %.4lf %.4lf\n"%(pos_np[i,0],pos_np[i,1],pos_np[i,2]))
-    if cnt>=10000:
-        resX = 256
-        grid_size = 1.0/resX
-        grid = VertexCenteredScalarGrid3((resX, resX, resX), (grid_size,grid_size,grid_size))
-        converter = SphPointsToImplicit3(1.5 * grid_size, 0.5)
-        converter.convert(pos_np.tolist(), grid)
-        surface_mesh = marchingCubes(
-            grid,
-            (grid_size,grid_size,grid_size),
-            (0, 0 ,0),
-            0.1,
-            DIRECTION_ALL,
-            DIRECTION_ALL
-        )
-        surface_mesh.writeObj('output/frame_{:06d}.obj'.format(cnt))
+def init_particles():
+    np_positions = np.zeros((num_particles, dim), dtype=np.float32)
+    #delta = h * 0.8
+    num_x = num_particles_x
+    num_y = num_particles_y
+    num_z = num_particles_z
+    assert num_x * num_y * num_z == num_particles
 
+    @ti.kernel
+    def init_board():
+        board_states[None] = ti.Vector([boundary[0] - epsilon, -0.0])
+    init_board()
 
-    #query_positions_density_np = query_positions_density.to_numpy()
-    #np.save("output/%d.npy"%(cnt),query_positions_density_np)
-    #mesh = marching_cubes_3d()
-    #for j in range(dim):
-    #    pos_np[:, j] = (pos_np[:, j]-b_min[j])/(b_max[j]-b_min[j])
-    #gui.circles(pos_np[:,0::2], radius=particle_radius, color=particle_color)
-    #gui.rect((0, 0), (1, 1),
-    #         radius=1.5,
-    #         color=boundary_color)
-    #gui.show()
-    return
+    for i in range(num_particles):
+        #np_positions[i] = np.array([i % num_x, i // num_x]) * delta + offs
+        np_positions = np.random.uniform([particle_radius_in_world, boundary[1]/2, particle_radius_in_world], 
+                                        np.array([board_states[None][0]/5, boundary[1], boundary[2]/5]) - particle_radius_in_world,
+                                        (num_particles,dim))
+    np_velocities = (np.random.rand(num_particles, dim).astype(np.float32) -
+                     0.5) * 4.0
+
+    @ti.kernel
+    def init(p: ti.ext_arr(), v: ti.ext_arr()):
+        for i in range(num_particles):
+            for c in ti.static(range(dim)):
+                positions[i][c] = p[i, c]
+                velocities[i][c] = v[i, c]
+
+    init(np_positions, np_velocities)
 
 
+cam = Canvas(screen_res[0], screen_res[1])
 @ti.kernel
 def draw_particle():
     for p_i in positions:
         cam.draw_sphere(positions[p_i], ti.Vector([1.0,1.0,1.0]))
 
+def genMesh(cnt):
+    pos_np = positions.to_numpy()/(res_3D / screen_to_world_ratio)
+    np.save("output/frame_%d"%(cnt),pos_np)
+    if cnt>360:
+        exit()
+    #resX = 256
+    #grid_size = 1.0/resX
+    #grid = VertexCenteredScalarGrid3((resX, resX, resX), (grid_size,grid_size,grid_size))
+    #converter = SphPointsToImplicit3(1.5 * grid_size, 0.5)
+    #converter.convert(pos_np.tolist(), grid)
+    #surface_mesh = marchingCubes(
+    #    grid,
+    #    (grid_size,grid_size,grid_size),
+    #    (0, 0 ,0),
+    #    0.1,
+    #    DIRECTION_ALL,
+    #    DIRECTION_ALL
+    #)
+    #surface_mesh.writeObj('output/frame_{:06d}.obj'.format(cnt))
 def main():
-    initParticles()
-    gui = ti.GUI('PBF3D', screen_res)
-    cnt = 0
+    init_particles()
+    print(f'boundary={boundary} grid={grid_size} cell_size={cell_size}')
+    gui = ti.GUI('PBF3D', (400,400))
+    frames = 0
     while gui.running:
-        cam.static_cam(0,0,0)
+        move_board()
+        run_pbf()
+        cam.static_cam(5,0,5)
         cam.clear_canvas()
-        runPBF() 
-        draw_particle()
-        gui.set_image(cam.img.to_numpy())
+        draw_particle() 
+        genMesh(frames)
+        frames+=1
+        img = cam.img.to_numpy()
+        gui.set_image(img)
         gui.show()
-        render(gui, cnt)
-        cnt+=1
 
 if __name__ == '__main__':
-    main() 
+    main()
