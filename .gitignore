@@ -1,2 +1,4 @@
 data/
 output/
+__pycache__/
+report.md

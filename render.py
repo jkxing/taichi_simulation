@@ -1,20 +1,29 @@
-# Macklin, M. and Müller, M., 2013. Position based fluids. ACM Transactions on Graphics (TOG), 32(4), p.104.
-# Based on 2D Taichi implementation by Ye Kuang (k-ye)
-
+import numblend as nb
 import taichi as ti
 import numpy as np
 import math
-import time
-from pyjet import *
-from canvas import Canvas
+import bpy
+import sys
+sys.path.append("F:\\code\\taichi_simulation")
+from marching_cube_taichi5 import MCISO,Voxelizer
 
-#import open3d as o3d
+#init setting
 
-ti.init(arch=ti.gpu)
+nb.init()
+ti.init(arch=ti.cpu)
+bpy.context.scene.frame_current = 0
+nb.delete_object('mciso_output')
+nb.delete_mesh('mciso_output')
+object = nb.new_object('mciso_output', nb.new_mesh('mciso_output'))
+
+#marching cube
+N = 64
+mciso = MCISO(N)
+voxel = Voxelizer(N)
+
 
 base_size_factor = 400
 scaling_size_factor = 1
-
 res_3D = np.array([1, 1, 1]) * base_size_factor * scaling_size_factor
 screen_res = res_3D[[0,2]].astype(np.int32) 
 
@@ -29,12 +38,9 @@ def round_up(f, s):
 grid_size = (round_up(boundary[0], 1), round_up(boundary[1], 1), round_up(boundary[2], 1))
 
 dim = 3
-bg_color = 0x112f41
-particle_color = 0x068587
-boundary_color = 0xebaca2
-num_particles_x = 40
-num_particles_y = 20
-num_particles_z = 20
+num_particles_x = 30
+num_particles_y = 30
+num_particles_z = 30
 num_particles = num_particles_x * num_particles_y * num_particles_z
 max_num_particles_per_cell = 200
 max_num_neighbors = 200
@@ -67,7 +73,6 @@ particle_num_neighbors = ti.var(ti.i32)
 particle_neighbors = ti.var(ti.i32)
 lambdas = ti.var(ti.f32)
 position_deltas = ti.Vector(dim, dt=ti.f32)
-# 0: x-pos, 1: timestep in sin()
 board_states = ti.Vector(2, dt=ti.f32)
 
 ti.root.dense(ti.i, num_particles).place(old_positions, positions, velocities)
@@ -81,7 +86,7 @@ ti.root.dense(ti.i, num_particles).place(lambdas, position_deltas)
 ti.root.place(board_states)
 
 
-
+#pbf method
 @ti.func
 def get_cell(pos):
     return (pos * cell_recpr).cast(int)
@@ -89,10 +94,8 @@ def get_cell(pos):
 @ti.func
 def confine_position_to_boundary(p):
     bmin = particle_radius_in_world
-    # First coordinate is for the x position of the board, which only moves in x
     bmax = ti.Vector([board_states[None][0], boundary[1], boundary[2]]) - particle_radius_in_world
     for i in ti.static(range(dim)):
-        # Use randomness to prevent particles from sticking into each other after clamping
         if p[i] <= bmin:
             p[i] = bmin + epsilon * ti.random()
         elif bmax[i] <= p[i]:
@@ -257,77 +260,56 @@ def run_pbf():
 
 
 def init_particles():
-    np_positions = np.zeros((num_particles, dim), dtype=np.float32)
-    #delta = h * 0.8
-    num_x = num_particles_x
-    num_y = num_particles_y
-    num_z = num_particles_z
-    assert num_x * num_y * num_z == num_particles
 
-    @ti.kernel
-    def init_board():
-        board_states[None] = ti.Vector([boundary[0] - epsilon, -0.0])
-    init_board()
-
+    delta = h * 0.8
     for i in range(num_particles):
-        #np_positions[i] = np.array([i % num_x, i // num_x]) * delta + offs
-        np_positions = np.random.uniform([particle_radius_in_world, boundary[1]/2, particle_radius_in_world], 
-                                        np.array([board_states[None][0]/5, boundary[1], boundary[2]/5]) - particle_radius_in_world,
-                                        (num_particles,dim))
-    np_velocities = (np.random.rand(num_particles, dim).astype(np.float32) -
-                     0.5) * 4.0
+        x = i%num_particles_x - num_particles_x/2
+        z = i//num_particles_x%num_particles_z - num_particles_z/2
+        y = i//(num_particles_x*num_particles_z) - num_particles_y/2
+        positions[i] = ti.Vector([x,z,y]) * delta + ti.Vector([boundary[0], boundary[1], boundary[2]])/2
 
-    @ti.kernel
-    def init(p: ti.ext_arr(), v: ti.ext_arr()):
-        for i in range(num_particles):
-            for c in ti.static(range(dim)):
-                positions[i][c] = p[i, c]
-                velocities[i][c] = v[i, c]
+    board_states[None] = ti.Vector([boundary[0] - epsilon, -0.0])
 
-    init(np_positions, np_velocities)
+#blender settings
+mat_name = "water"
+bpy.context.scene.render.engine = 'CYCLES'
+newmat = bpy.data.materials.new(mat_name)
+newmat.use_nodes = True
+node_tree = newmat.node_tree
+nodes = node_tree.nodes
+bsdf = nodes.get("Principled BSDF") 
+assert(bsdf) 
+bsdf.inputs[0].default_value=(0.0,0.5,0.5,0.5)
+bsdf.inputs[7].default_value=(0.5)
+bsdf.inputs[9].default_value=(0.0)
+bsdf.inputs[17].default_value=(1.0)
+bsdf.inputs[16].default_value=(1.333)
 
+tree_nodes = bpy.data.worlds["World"].node_tree.nodes
+node_background = bpy.data.worlds["World"].node_tree.nodes["Background"]
+node_environment = tree_nodes.new('ShaderNodeTexEnvironment')
+node_environment.image = bpy.data.images.load("C:\\Program Files\\Blender Foundation\\Blender 2.83\\2.83\\datafiles\\studiolights\\world\\sunset.exr") # Relative path
+links = bpy.data.worlds["World"].node_tree.links
+link = links.new(node_environment.outputs[0], node_background.inputs[0])
 
-cam = Canvas(screen_res[0], screen_res[1])
-@ti.kernel
-def draw_particle():
-    for p_i in positions:
-        cam.draw_sphere(positions[p_i], ti.Vector([1.0,1.0,1.0]))
+bpy.data.objects[f'mciso_output'].scale =  (3,3,3)
+bpy.data.objects["mciso_output"].location =  (-1.5,-1.5,-1)
 
-def genMesh(cnt):
-    pos_np = positions.to_numpy()/(res_3D / screen_to_world_ratio)
-    np.save("output/frame_%d"%(cnt),pos_np)
-    if cnt>360:
-        exit()
-    #resX = 256
-    #grid_size = 1.0/resX
-    #grid = VertexCenteredScalarGrid3((resX, resX, resX), (grid_size,grid_size,grid_size))
-    #converter = SphPointsToImplicit3(1.5 * grid_size, 0.5)
-    #converter.convert(pos_np.tolist(), grid)
-    #surface_mesh = marchingCubes(
-    #    grid,
-    #    (grid_size,grid_size,grid_size),
-    #    (0, 0 ,0),
-    #    0.1,
-    #    DIRECTION_ALL,
-    #    DIRECTION_ALL
-    #)
-    #surface_mesh.writeObj('output/frame_{:06d}.obj'.format(cnt))
+@nb.add_animation
 def main():
     init_particles()
-    print(f'boundary={boundary} grid={grid_size} cell_size={cell_size}')
-    gui = ti.GUI('PBF3D', (400,400))
-    frames = 0
-    while gui.running:
-        move_board()
+    for frame in range(720):
+        if frame>120:
+            move_board() 
         run_pbf()
-        cam.static_cam(5,0,5)
-        cam.clear_canvas()
-        draw_particle() 
-        genMesh(frames)
-        frames+=1
-        img = cam.img.to_numpy()
-        gui.set_image(img)
-        gui.show()
+        mciso.clear() 
+        voxel.voxelize(mciso.m, positions, 8) 
+        mciso.march()
+        vs, fs = mciso.get_mesh()
+        nb.delete_object(f'mciso_output_{frame}')
+        mesh = nb.new_mesh(f'mciso_output_{frame}', vs, [], fs)
+        mesh.materials.append(newmat) 
+        yield nb.object_mesh_update(object, mesh) 
 
-if __name__ == '__main__':
-    main()
+
+
